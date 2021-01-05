@@ -1,0 +1,473 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Sonrai Dig CT Automation (MPCT-gufqzryx)
+Parameters:
+  CollectorExternalId:
+    Type: String
+    Description: External ID (uuid) provided from Sonrai Dig
+    AllowedPattern: '^[0-9a-f]{8}\b-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-\b[0-9a-f]{12}$'
+    MinLength: 36
+    MaxLength: 36
+  CollectorName:
+    Type: String
+    Description: Name of the Sonrai Dig collector deployment
+    MinLength: 0
+  OrgId:
+    Type: String
+    Description: The Amazon Organization ID
+    MinLength: 12
+    MaxLength: 12
+    AllowedPattern: '^[o][\-][a-z0-9]{10}$'
+    ConstraintDescription: The Org Id must be a 12 character string starting with o- and followed by 10 lower case alphanumeric characters
+  CollectorAccount:
+    Type: String
+    Description: Account containing deployed Sonrai Dig Collectors
+    AllowedPattern: '^[0-9]{12}$'
+    MinLength: 12
+    MaxLength: 12
+  AuditAccount:
+    Type: String
+    Description: Control Tower AWS audit account
+    AllowedPattern: '^[0-9]{12}$'
+    MinLength: 12
+    MaxLength: 12
+  LogArchiveAccount:
+    Type: String
+    Description: Control Tower AWS log archive account
+    AllowedPattern: '^[0-9]{12}$'
+    MinLength: 12
+    MaxLength: 12
+  RoleName:
+    Type: String
+    Description: Role Name to use for Sonrai Dig
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*'
+    MinLength: 3
+    MaxLength: 36
+    Default: sonrai-collector-role   
+  SourceBucket:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '[a-zA-Z0-9-.]*'
+    Description: The S3 bucket which contains Lambda package (deployment region will be automatically suffixed)
+    Default: sonrai-global-artifacts-public
+  StackSetName:
+    Type: String
+    Description: Name of the StackSet that will be deployed in Control Tower Management account
+    Default: 'SonraiDigAccess'
+  SonraiAPIToken:
+    Type: String
+    NoEcho: true
+    Description: Sonrai Dig API Token
+
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups:
+      -
+        Label:
+          default: "Sonrai Dig Configuration"
+        Parameters:
+          - CollectorName
+          - CollectorExternalId
+          - CollectorAccount
+          - SonraiAPIToken
+      - 
+        Label:
+          default: "Organization Configuration"
+        Parameters:
+          - OrgId
+          - AuditAccount
+          - LogArchiveAccount
+      -
+        Label:
+          default: "Deployment Configuration"
+        Parameters:
+          - SourceBucket
+          - StackSetName
+
+    ParameterLabels: 
+        CollectorExternalId:
+          default: "Sonrai Dig Collector Role External Id (UUID)"
+        CollectorAccount:
+          default: "Sonrai Dig Collector Account Number"
+        StackSetName:
+          default: "Stack Set Name"
+        StackSetTemplateUrl:
+          default: "Stack Set Template Url"
+        SourceBucket:
+          default: "Source Bucket"
+        OrgId:
+          default: "Organization Id"
+        AuditAccount:
+          default: "Audit Account Number"
+        LogArchiveAccount:
+          default: "Log Archive Account Number"
+        CollectorName:
+          default: "Sonrai Dig Collector Deployment Name"
+        SonraiAPIToken:
+          default: "Sonrai Dig API token"
+
+Resources:
+
+  SonraiCredentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Sonrai API Token
+      SecretString:
+        Fn::Join:
+        - ''
+        - - '{"sonrai_token":"'
+          - Ref: SonraiAPIToken
+          - '"}'
+      KmsKeyId: !GetAtt SonraiControlTowerKMSKey.Arn
+
+  SonraiSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref SonraiCredentials
+      ResourcePolicy:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: 
+                - !GetAtt SonraiDigSetupRole.Arn
+                - !GetAtt SonraiCredentialRotationRole.Arn
+            Action: 'secretsmanager:GetSecretValue'
+            "Resource": !Ref SonraiCredentials
+
+  SonraiControlTowerKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "This is KMS Key Id used to encrypt/decrypt the Secret"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+        - Sid: Allow administration of the key
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action:
+            - kms:Create*
+            - kms:Describe*
+            - kms:Enable*
+            - kms:List*
+            - kms:Put*
+            - kms:Update*
+            - kms:Revoke*
+            - kms:Disable*
+            - kms:Get*
+            - kms:Delete*
+            - kms:ScheduleKeyDeletion
+            - kms:CancelKeyDeletion
+          Resource: '*'
+        - Sid: Allow use of the key
+          Effect: Allow
+          Principal:
+            AWS: !Sub ${AWS::AccountId}
+          Action:
+            - kms:Encrypt
+            - kms:Decrypt
+            - kms:ReEncrypt
+            - kms:GenerateDataKey
+            - kms:CreateGrant
+            - kms:DescribeKey
+          Resource: '*'
+          Condition:
+            StringEquals:
+              kms:ViaService: !Sub secretsmanager.${AWS::Region}.amazonaws.com
+              kms:CallerAccount: !Sub ${AWS::AccountId}
+
+  SonraiCredentialRotation:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: SonraiCredentialRotation
+      Description: Sets up stack sets for Sonrai Dig scanning
+      Handler: "main.main.lambda_handler"
+      Role: !GetAtt SonraiCredentialRotationRole.Arn
+      Code:
+        S3Bucket: !Join [".", [!Ref SourceBucket, !Ref "AWS::Region"]]
+        S3Key: control_tower_integration/lambda/rotate_credentials-1.1.0.zip
+      Runtime: "python3.7"
+      MemorySize: 128
+      Timeout: 900
+      Environment:
+        Variables:
+          SECRETS_MANAGER_ENDPOINT: !Sub 'https://secretsmanager.${AWS::Region}.amazonaws.com'
+
+  SonraiCredentialRotationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Role used by Lambda that rotates credentials for Sonrai Dig API
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+      - PolicyName: SonraiCredentialRotation
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:DescribeSecret
+              - secretsmanager:UpdateSecretVersionStage
+            Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:SonraiCredentials-*'
+          - Effect: Allow
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt
+              - kms:GenerateDataKey
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: !GetAtt SonraiControlTowerKMSKey.Arn
+
+  SonraiCredentialRotationPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: SonraiCredentialRotation
+    Properties:
+      FunctionName: !Ref SonraiCredentialRotation
+      Action: lambda:InvokeFunction
+      Principal: secretsmanager.amazonaws.com
+
+  SonraiCredentialsRotationSchedule:
+    Type: AWS::SecretsManager::RotationSchedule
+    DependsOn: 
+      - SonraiCredentialRotation
+      - SonraiCredentialRotationPermission
+    Properties: 
+      RotationLambdaARN: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:SonraiCredentialRotation'
+      RotationRules: 
+         AutomaticallyAfterDays: 15
+      SecretId: !Ref SonraiCredentials
+                
+  SonraiStackCTSet:
+    Type: AWS::CloudFormation::StackSet
+    Properties: 
+      AdministrationRoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/service-role/AWSControlTowerStackSetRole'
+      ExecutionRoleName: AWSControlTowerExecution
+      Capabilities: 
+        - 'CAPABILITY_IAM'
+        - 'CAPABILITY_NAMED_IAM'
+        - 'CAPABILITY_AUTO_EXPAND'
+      Description: Sonrai Security Collector Role
+      Parameters: 
+        - ParameterKey: CollectorAccount
+          ParameterValue: !Ref CollectorAccount
+        - ParameterKey: CollectorExternalId
+          ParameterValue: !Ref CollectorExternalId
+        - ParameterKey: RoleName
+          ParameterValue: !Ref RoleName
+      PermissionModel: SELF_MANAGED
+      StackSetName: !Ref StackSetName
+      TemplateBody: |
+        AWSTemplateFormatVersion: 2010-09-09
+        Description: Sonrai Security Collector Role
+        Parameters:
+          CollectorAccount:
+            Type: String
+            Description: Designated AWS account running Sonrai Security Collectors
+            AllowedPattern: '^[0-9]{12}$'
+            MinLength: 12
+            MaxLength: 12
+          CollectorExternalId:
+            Type: String
+            Description: Designated AWS account running Sonrai Security Collectors
+            AllowedPattern: '^[0-9a-f]{8}\b-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-\b[0-9a-f]{12}$'
+            MinLength: 36
+            MaxLength: 36
+          RoleName:
+            Type: String
+            Description: Role Name to use for Sonrai Dig
+            AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]*'
+            MinLength: 3
+            MaxLength: 36
+            Default: sonrai-collector-role   
+
+        Resources:
+          SonraiCollectorRole:
+            Type: AWS::IAM::Role
+            Properties:
+              RoleName: !Ref RoleName
+              Description: Role used by Sonrai Security Collectors to access this account
+              AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  -
+                    Effect: "Allow"
+                    Principal:
+                      AWS:
+                        - !Sub 'arn:aws:iam::${CollectorAccount}:root'  
+                    Action:
+                      - "sts:AssumeRole"
+                    Condition:
+                      StringEquals:
+                        sts:ExternalId: !Ref CollectorExternalId
+              Path: "/"
+              ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/ReadOnlyAccess
+
+  SonraiDigSetup:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: Sets up stack sets for Sonrai Dig scanning
+      Handler: "main.main.handle"
+      Role: !GetAtt SonraiDigSetupRole.Arn
+      Code:
+        S3Bucket: !Join [".", [!Ref SourceBucket, !Ref "AWS::Region"]]
+        S3Key: control_tower_integration/lambda/setup-1.1.0.zip
+      Runtime: "python3.7"
+      MemorySize: 128
+      Timeout: 900
+      Environment:
+        Variables:
+            stack_set_name: !Ref StackSetName
+            sonrai_deployment_name: !Ref CollectorName
+            role_name: !Ref RoleName
+            secret: !Ref SonraiCredentials
+
+  SonraiDigSetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Role used by Lambda that sets up accounts for Sonrai Dig scanning
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+      - PolicyName: SonraiDigSetup
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+          - Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource:
+              - !Sub 'arn:aws:iam::${AWS::AccountId}:role/service-role/AWSControlTowerStackSetRole'
+          - Effect: Allow
+            Action:
+              - cloudformation:CreateStackSet
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - cloudformation:ListStackInstances
+              - cloudformation:CreateStackInstances
+              - cloudformation:DescribeStackSetOperation
+              - cloudformation:DescribeStackInstance
+            Resource:
+              - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stackset/${StackSetName}:*'
+          - Effect: Allow
+            Action:
+              - organizations:ListAccounts
+              - organizations:ListAccountsForParent
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref SonraiCredentials
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+            Resource: !GetAtt SonraiControlTowerKMSKey.Arn
+
+  SonraiCollectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: Role used by Sonrai Security Collectors to access this account
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${CollectorAccount}:root'  
+            Action:
+              - "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref CollectorExternalId
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+
+
+  NewAccountEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Event Rule to capture new account creation
+      EventPattern:
+        {
+          "source": [
+            "aws.controltower"
+          ],
+          "detail-type": [
+            "AWS Service Event via CloudTrail"
+          ],
+          "detail": {
+            "eventName": [
+              "CreateManagedAccount"
+            ]
+          }
+        }
+      State: ENABLED
+      Targets:
+      - Arn: !GetAtt SonraiDigSetup.Arn
+        Id: "CreateAccountLifeCycle"
+
+  NewAccountEventRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SonraiDigSetup.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt NewAccountEventRule.Arn
+
+  SetupResources:
+    DependsOn:
+      - SonraiStackCTSet
+      - SonraiDigSetupRole
+      - SonraiDigSetup
+    Type: "AWS::CloudFormation::CustomResource"
+    Properties:
+      ServiceToken: !GetAtt SonraiDigSetup.Arn
+      OrgId: !Ref OrgId
+      LogArchiveAccount: !Ref LogArchiveAccount
+      ManagementAccount: !Ref AWS::AccountId
+      ManagementRegion: !Ref AWS::Region
+      AuditAccount: !Ref AuditAccount
+      StackSetName: !Ref StackSetName
+

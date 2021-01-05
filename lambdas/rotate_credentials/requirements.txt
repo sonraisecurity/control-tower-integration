@@ -1,0 +1,4 @@
+requests==2.22.0
+pyJWT==1.7.1
+#boto comes with the lambda
+#boto3==1.10.22
