@@ -134,7 +134,7 @@ def create_secret(service_client, arn, token):
         newTokenResponse = get_graphql_client(get_secret_value_response['SecretString']).query(generateNewToken, variables)
         newToken = newTokenResponse['GenerateSonraiUserToken']['token']
 
-        secret = {}
+        secret = json.loads(get_secret_value_response['SecretString'])
         secret['sonrai_token'] = newToken
 
         # Put the secret
